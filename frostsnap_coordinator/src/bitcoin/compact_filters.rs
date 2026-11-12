@@ -1,5 +1,7 @@
 //! Compact block filter matching for the BIP157 backend.
 
+pub mod node;
+
 use super::wallet::{KeychainId, WalletIndexer};
 use bdk_chain::{
     bitcoin::{Block, OutPoint, ScriptBuf, Transaction},
