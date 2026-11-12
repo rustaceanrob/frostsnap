@@ -230,6 +230,8 @@ impl FilterStatusTracker {
 enum Message {
     RefreshWatchSet,
     SetStatusSink(Box<dyn Sink<ChainStatus>>),
+    /// Check past filters again for the watched scripts, for a wallet that may have history.
+    Rescan,
 }
 
 /// Cheap, cloneable handle the rest of the app holds.
@@ -323,6 +325,12 @@ impl FilterClient {
 
     /// No-op: the node keeps a rotating set of peers, and a rescan belongs behind its own action.
     pub fn reconnect(&self) {}
+
+    /// Filters already checked were checked without the new scripts, so go over them again from
+    /// the birthday.
+    pub fn find_history(&self) {
+        let _ = self.req_sender.unbounded_send(Message::Rescan);
+    }
 }
 
 /// Owns the node and event loop; run on a dedicated thread.
@@ -419,6 +427,11 @@ impl FilterHandler {
             start_height,
             ..Default::default()
         };
+        let birthday_height = self.config.birthday.height;
+        // bip157 ignores a rescan until the node first reaches the tip, so one asked for earlier
+        // waits for that.
+        let mut synced = false;
+        let mut rescan_when_synced = false;
         let node_handle = rt.spawn(async move { node.run().await });
         rt.block_on(async move {
             let mut gossip = None;
@@ -504,6 +517,10 @@ impl FilterHandler {
                                     last_active_indices: Default::default(),
                                     chain_update: Some(tip.clone()),
                                 });
+                                synced = true;
+                                if std::mem::take(&mut rescan_when_synced) {
+                                    rescan_from(&requester, birthday_height);
+                                }
                             }
                         }
                     }
@@ -569,6 +586,17 @@ impl FilterHandler {
                                 subscribe_watch_set_to_gossip(&requester, &watch, &mut gossip)
                                     .await;
                             }
+                            Some(Message::Rescan) => {
+                                let (_fresh_tip, fresh_watch) = snapshot(&super_wallet);
+                                watch = fresh_watch;
+                                subscribe_watch_set_to_gossip(&requester, &watch, &mut gossip)
+                                    .await;
+                                if synced {
+                                    rescan_from(&requester, birthday_height);
+                                } else {
+                                    rescan_when_synced = true;
+                                }
+                            }
                             Some(Message::SetStatusSink(sink)) => {
                                 status.set_sink(sink);
                             }
@@ -627,6 +655,18 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default()
+}
+
+/// Check filters after `height` again against the watched scripts.
+fn rescan_from(requester: &Requester, height: u32) {
+    match requester.rescan_from(height) {
+        Ok(()) => event!(
+            Level::INFO,
+            from = height,
+            "rescanning filters for wallet history"
+        ),
+        Err(err) => event!(Level::WARN, ?err, "could not start a rescan"),
+    }
 }
 
 async fn next_message(rx: &mut mpsc::UnboundedReceiver<Message>) -> Option<Message> {
