@@ -26,7 +26,9 @@ import 'package:frostsnap/wallet.dart';
 import 'package:glowy_borders/glowy_borders.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-const BROADCAST_TIMEOUT = Duration(seconds: 3);
+// As long as a compact filter node waits to hear a broadcast relayed back, so a broadcast that went
+// through is not reported as failed while the node is still waiting.
+const BROADCAST_TIMEOUT = Duration(seconds: 10);
 
 /// What a signing screen needs, in the two shapes it comes in.
 ///
