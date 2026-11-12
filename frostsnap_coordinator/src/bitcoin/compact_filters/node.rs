@@ -2,7 +2,7 @@
 
 use super::{WatchSet, MATCH_LOOKAHEAD};
 use crate::bitcoin::{
-    chain_sync::ChainStatus,
+    backend::{ChainStatus, ChainStatusDetail, ChainStatusState, FilterStatus},
     wallet::{CoordSuperWallet, KeychainId},
 };
 use crate::Sink;
@@ -14,8 +14,8 @@ use bdk_chain::{
 };
 use bip157::{
     chain::{BlockHeaderChanges, IndexedHeader},
-    ChainState, Event, GossipMonitorRequestBuilder, HashCheckpoint, Receiver, Requester,
-    TrustedPeer,
+    ChainState, Event, GossipMonitorRequestBuilder, HashCheckpoint, Info, Receiver, Requester,
+    TrustedPeer, Warning,
 };
 use futures::channel::mpsc;
 use std::{
@@ -34,6 +34,10 @@ const DEFAULT_REQUIRED_PEERS: u8 = 2;
 /// Worker threads for the node's runtime. They only carry the node and its peer connections:
 /// the event loop runs on the handler's own thread and wallet writes on tokio's blocking pool.
 const NODE_WORKER_THREADS: usize = 2;
+
+/// A filter counts as this many filter headers when estimating sync progress, bip157's own
+/// estimate of the relative cost of fetching and checking one.
+const FILTER_COST_IN_HEADERS: u32 = 3;
 
 /// Pick the starting `ChainState` given the wallet's tip and birthday.
 fn seed_state(tip: &CheckPoint, birthday: HashCheckpoint) -> ChainState {
@@ -105,6 +109,121 @@ fn default_birthday(network: bitcoin::Network) -> HashCheckpoint {
     match network {
         bitcoin::Network::Bitcoin => HashCheckpoint::taproot_activation(),
         _ => HashCheckpoint::from_genesis(bitcoin::params::Params::new(network)),
+    }
+}
+
+/// Projects node events into the app's `ChainStatus`, deduping repeated emissions.
+struct FilterStatusTracker {
+    peers: u32,
+    /// Height the node resumed from; progress counts from here.
+    start_height: u32,
+    chain_height: u32,
+    filter_headers_height: u32,
+    filters_height: u32,
+    connected: bool,
+    last_emitted: Option<ChainStatus>,
+    sink: Box<dyn Sink<ChainStatus>>,
+}
+
+impl Default for FilterStatusTracker {
+    fn default() -> Self {
+        Self {
+            peers: 0,
+            start_height: 0,
+            chain_height: 0,
+            filter_headers_height: 0,
+            filters_height: 0,
+            connected: false,
+            last_emitted: None,
+            sink: Box::new(()),
+        }
+    }
+}
+
+impl FilterStatusTracker {
+    fn set_sink(&mut self, sink: Box<dyn Sink<ChainStatus>>) {
+        self.sink = sink;
+        let status = self.project();
+        self.last_emitted = Some(status.clone());
+        self.sink.send(status);
+    }
+
+    fn handshake(&mut self) {
+        self.peers = self.peers.saturating_add(1);
+        self.emit();
+    }
+
+    fn connections_met(&mut self) {
+        self.connected = true;
+        self.emit();
+    }
+
+    fn needs_connections(&mut self) {
+        self.connected = false;
+        self.peers = 0;
+        self.emit();
+    }
+
+    fn set_chain_height(&mut self, height: u32) {
+        self.chain_height = height;
+        self.emit();
+    }
+
+    fn set_filter_headers_height(&mut self, height: u32) {
+        self.filter_headers_height = height;
+        self.emit();
+    }
+
+    fn set_filters_height(&mut self, height: u32) {
+        self.filters_height = height;
+        self.emit();
+    }
+
+    /// Everything up to `height` is checked, including a range a headers-only sync skipped
+    /// without reporting filter progress.
+    fn synced_to(&mut self, height: u32) {
+        self.chain_height = self.chain_height.max(height);
+        self.filter_headers_height = height;
+        self.filters_height = height;
+        self.emit();
+    }
+
+    /// Fraction of the range from `start_height` to the tip checked, a filter counting as
+    /// `FILTER_COST_IN_HEADERS` filter headers. Rounded to a percent, so a download that reports
+    /// every filter does not emit a status per filter.
+    fn progress(&self) -> f32 {
+        let total = self.chain_height.saturating_sub(self.start_height);
+        if total == 0 {
+            return 0.0;
+        }
+        let checked_since_start = |height: u32| height.saturating_sub(self.start_height).min(total);
+        let weighted = checked_since_start(self.filter_headers_height)
+            + FILTER_COST_IN_HEADERS * checked_since_start(self.filters_height);
+        let out_of = (1 + FILTER_COST_IN_HEADERS) * total;
+        (100.0 * weighted as f32 / out_of as f32).floor() / 100.0
+    }
+
+    fn project(&self) -> ChainStatus {
+        ChainStatus {
+            state: match (self.connected, self.peers) {
+                (true, _) => ChainStatusState::Connected,
+                (false, 0) => ChainStatusState::Idle,
+                (false, _) => ChainStatusState::Connecting,
+            },
+            detail: ChainStatusDetail::CompactFilters(FilterStatus {
+                peers: self.peers,
+                progress: self.progress(),
+            }),
+        }
+    }
+
+    fn emit(&mut self) {
+        let status = self.project();
+        if self.last_emitted.as_ref() == Some(&status) {
+            return;
+        }
+        self.last_emitted = Some(status.clone());
+        self.sink.send(status);
     }
 }
 
@@ -262,6 +381,10 @@ impl FilterHandler {
         let network = self.config.network;
         let rt = self.runtime.clone();
         let mut req_recv = self.req_recv;
+        let start_height = match &seed {
+            ChainState::Checkpoint(checkpoint) => checkpoint.height,
+            ChainState::Snapshot(_) => 0,
+        };
         let mut builder = bip157::Builder::new(self.config.network)
             .required_peers(self.config.required_peers)
             .chain_state(seed)
@@ -276,7 +399,8 @@ impl FilterHandler {
         let bip157::Client {
             requester,
             mut event_rx,
-            ..
+            mut info_rx,
+            mut warn_rx,
         } = client;
         *self.requester.lock().unwrap() = Some(requester.clone());
         let (update_sender, update_recv) =
@@ -291,6 +415,10 @@ impl FilterHandler {
                 )
             }
         });
+        let mut status = FilterStatusTracker {
+            start_height,
+            ..Default::default()
+        };
         let node_handle = rt.spawn(async move { node.run().await });
         rt.block_on(async move {
             let mut gossip = None;
@@ -370,12 +498,44 @@ impl FilterHandler {
                                     height = sync.tip.height,
                                     "filters synced to tip"
                                 );
+                                status.synced_to(sync.tip.height);
                                 let _ = update_sender.unbounded_send(FullScanResponse {
                                     tx_update: Default::default(),
                                     last_active_indices: Default::default(),
                                     chain_update: Some(tip.clone()),
                                 });
                             }
+                        }
+                    }
+                    info = info_rx.recv() => {
+                        match info {
+                            Some(Info::NewChainHeight(height)) => status.set_chain_height(height),
+                            Some(Info::CFHeadersAdded(height)) => {
+                                status.set_filter_headers_height(height)
+                            }
+                            Some(Info::FilterAdded(height)) => status.set_filters_height(height),
+                            Some(Info::ConnectionsMet) => {
+                                event!(Level::INFO, "connected to enough peers");
+                                status.connections_met()
+                            }
+                            Some(Info::SuccessfulHandshake) => {
+                                event!(Level::DEBUG, "handshake with a peer");
+                                status.handshake()
+                            }
+                            Some(Info::BlockReceived(_)) => {}
+                            None => break,
+                        }
+                    }
+                    warning = warn_rx.recv() => {
+                        match warning {
+                            Some(Warning::NeedConnections { connected, required }) => {
+                                event!(Level::INFO, connected, required, "waiting for peers");
+                                status.needs_connections()
+                            }
+                            Some(warning) => {
+                                event!(Level::DEBUG, %warning, "compact filter node warning");
+                            }
+                            None => break,
                         }
                     }
                     tx = recv_gossip(&mut gossip) => {
@@ -409,7 +569,9 @@ impl FilterHandler {
                                 subscribe_watch_set_to_gossip(&requester, &watch, &mut gossip)
                                     .await;
                             }
-                            Some(Message::SetStatusSink(_sink)) => {}
+                            Some(Message::SetStatusSink(sink)) => {
+                                status.set_sink(sink);
+                            }
                             None => break,
                         }
                     }
@@ -574,6 +736,94 @@ mod test {
             !can_sync_headers_only(&synced, &nothing),
             "a synced chain resumes as before"
         );
+    }
+
+    /// One peer is not the quorum the node was told to reach, so it must not read as connected.
+    /// Reporting "connected" off a single handshake would tell the user their wallet is up to date
+    /// while the node is still waiting to trust what it hears.
+    #[test]
+    fn status_connecting_until_required_peers_met() {
+        let mut status = FilterStatusTracker::default();
+        assert_eq!(status.project().state, ChainStatusState::Idle);
+
+        status.handshake();
+        assert_eq!(status.project().state, ChainStatusState::Connecting);
+
+        status.connections_met();
+        assert_eq!(status.project().state, ChainStatusState::Connected);
+    }
+
+    #[test]
+    fn status_resets_peer_count_when_connections_lost() {
+        let mut status = FilterStatusTracker::default();
+        status.handshake();
+        status.handshake();
+        status.connections_met();
+
+        status.needs_connections();
+        let projected = status.project();
+        assert_eq!(projected.state, ChainStatusState::Idle);
+        match projected.detail {
+            ChainStatusDetail::CompactFilters(filters) => assert_eq!(filters.peers, 0),
+            other => panic!("expected compact filter detail, got {other:?}"),
+        }
+    }
+
+    /// A headers-only sync reports no filter progress, but reaching the tip is still all of it.
+    #[test]
+    fn status_progress_complete_after_headers_only_sync() {
+        let mut status = FilterStatusTracker {
+            start_height: 100,
+            ..Default::default()
+        };
+        status.set_chain_height(200);
+        assert_eq!(status.progress(), 0.0);
+        status.synced_to(200);
+        assert_eq!(status.progress(), 1.0);
+    }
+
+    #[test]
+    fn status_progress_measured_from_resume_height() {
+        let mut status = FilterStatusTracker {
+            start_height: 100,
+            ..Default::default()
+        };
+        assert_eq!(status.progress(), 0.0, "no tip known yet");
+        status.set_chain_height(200);
+        status.set_filter_headers_height(200);
+        status.set_filters_height(150);
+        // All 100 filter headers plus half the filters, a filter weighing three headers.
+        assert_eq!(status.progress(), 0.62);
+        status.set_filters_height(200);
+        assert_eq!(status.progress(), 1.0);
+    }
+
+    /// The node reports progress continuously through a long download; forwarding every one would
+    /// be a stream of identical statuses.
+    #[test]
+    fn status_deduplicates_unchanged_emissions() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Log(Arc<Mutex<Vec<ChainStatus>>>);
+        impl crate::Sink<ChainStatus> for Log {
+            fn send(&self, status: ChainStatus) {
+                self.0.lock().unwrap().push(status);
+            }
+        }
+
+        let log = Log(Default::default());
+        let mut status = FilterStatusTracker::default();
+        status.set_sink(Box::new(log.clone()));
+        assert_eq!(
+            log.0.lock().unwrap().len(),
+            1,
+            "a new sink sees the current status"
+        );
+
+        status.connections_met();
+        status.connections_met();
+        assert_eq!(log.0.lock().unwrap().len(), 2, "only the change was sent");
     }
 
     #[test]
